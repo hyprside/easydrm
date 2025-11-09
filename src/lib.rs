@@ -1,0 +1,408 @@
+//! # EasyDRM - Minimal DRM/KMS Framework
+//!
+//! EasyDRM provides a simple, GLFW-like API for direct rendering on Linux without
+//! a compositor (no X11, no Wayland). It's designed for fullscreen applications,
+//! kiosks, embedded systems, or custom compositors.
+//!
+//! ## Features
+//!
+//! - **Multi-monitor support** with independent OpenGL ES contexts per monitor
+//! - **Hot-plug detection** - monitors can be added/removed at runtime
+//! - **Zero-monitor graceful handling** - doesn't crash without monitors
+//! - **Per-monitor user context** - attach custom data (Skia, Cairo, etc.)
+//! - **VSync coordination** across multiple monitors with different refresh rates
+//! - **Atomic commits** with proper fence synchronization
+//! - **3-state mode management** for efficient mode setting
+//!
+//! ## Basic Usage
+//!
+//! ```no_run
+//! use easydrm::EasyDRM;
+//!
+//! // Initialize without custom context
+//! let mut easydrm = EasyDRM::init_empty().unwrap();
+//!
+//! loop {
+//!     // Wait for events (page flip, hotplug, etc.)
+//!     easydrm.poll_events().unwrap();
+//!
+//!     // Render to each monitor that's ready
+//!     for monitor in easydrm.monitors() {
+//!         if monitor.can_render() {
+//!             monitor.make_current().unwrap();
+//!             let gl = monitor.gl();
+//!             unsafe {
+//!                 gl.Clear(gl::COLOR_BUFFER_BIT);
+//!             }
+//!         }
+//!     }
+//!
+//!     // Commit all drawn monitors
+//!     easydrm.swap_buffers().unwrap();
+//! }
+//! ```
+//!
+//! ## With Custom Context
+//!
+//! ```no_run
+//! use easydrm::EasyDRM;
+//!
+//! struct MyContext {
+//!     frame_count: u32,
+//! }
+//!
+//! let mut easydrm = EasyDRM::init(|_gl| MyContext { frame_count: 0 }).unwrap();
+//!
+//! for monitor in easydrm.monitors() {
+//!     let ctx = monitor.context_mut();
+//!     ctx.frame_count += 1;
+//! }
+//! ```
+
+use std::collections::{HashMap, HashSet};
+use std::os::fd::AsFd;
+use std::os::unix::io::AsRawFd;
+
+use drm::Device;
+use drm::control::{Device as ControlDevice, Event, connector};
+use gbm::Device as GbmDevice;
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use thiserror::Error;
+
+use crate::card::Card;
+use crate::monitor::MonitorSetupError;
+
+mod card;
+mod gles_context;
+mod hotplug;
+mod monitor;
+
+// Public API exports
+pub use monitor::Monitor;
+
+/// OpenGL ES bindings generated at build time
+#[allow(clippy::all, warnings)]
+pub mod gl {
+    include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
+}
+
+#[derive(Debug, Error)]
+pub enum EasyDRMError {
+    #[error("IO Error: {0}")]
+    IOError(#[from] std::io::Error),
+    #[error("Monitor setup error: {0}")]
+    MonitorSetup(#[from] MonitorSetupError),
+}
+
+pub struct EasyDRM<T> {
+    card: Card,
+    gbm_device: GbmDevice<std::fs::File>,
+    monitors: HashMap<connector::Handle, Monitor<T>>,
+    refresh_rate_groups: HashMap<u32, Vec<connector::Handle>>, // refresh_rate -> connector handles
+    context_constructor: Box<dyn Fn(&crate::gl::Gles2) -> T>,
+    uevent_socket: Option<hotplug::UEventSocket>,
+}
+
+impl<T> EasyDRM<T> {
+    /// Initialize EasyDRM with a custom context constructor for each monitor
+    ///
+    /// The context_constructor is called for each monitor with access to its GL bindings,
+    /// allowing you to initialize per-monitor resources (like Skia surfaces, Cairo contexts, etc.)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// struct MyContext {
+    ///     skia_surface: skia::Surface,
+    /// }
+    ///
+    /// let easydrm = EasyDRM::init(|gl| {
+    ///     MyContext {
+    ///         skia_surface: create_skia_surface(gl),
+    ///     }
+    /// })?;
+    /// ```
+    ///
+    /// Note: EasyDRM will successfully initialize even with zero monitors connected as long as you have a GPU.
+    /// Monitors can be hot-plugged later and will be automatically discovered via `poll_events()`.
+    pub fn init<F>(context_constructor: F) -> Result<Self, EasyDRMError>
+    where
+        F: Fn(&crate::gl::Gles2) -> T + 'static,
+    {
+        // Open DRM card
+        let card = Card::open_default_card();
+
+        // Enable required capabilities
+        card.set_client_capability(drm::ClientCapability::UniversalPlanes, true)
+            .expect("Unable to request UniversalPlanes capability");
+        card.set_client_capability(drm::ClientCapability::Atomic, true)
+            .expect("Unable to request Atomic capability");
+
+        // Create GBM device (needs ownership, so we clone the file descriptor)
+        let fd = card.as_raw_fd();
+        let gbm_device = unsafe {
+            use std::os::unix::io::FromRawFd;
+            GbmDevice::new(std::fs::File::from_raw_fd(libc::dup(fd)))
+                .expect("Failed to create GBM device")
+        };
+
+        let mut easydrm = EasyDRM {
+            card,
+            gbm_device,
+            monitors: HashMap::new(),
+            refresh_rate_groups: HashMap::new(),
+            context_constructor: Box::new(context_constructor),
+            uevent_socket: hotplug::UEventSocket::open().ok(),
+        };
+        if easydrm.uevent_socket.is_none() {
+            eprintln!(
+                "[WARNING] Failed to open uevent socket, monitors plugged in afterwards won't be able to be detected"
+            );
+        }
+        // Discover and initialize all connected monitors
+        easydrm.discover_monitors()?;
+
+        // It's OK to have zero monitors - they might be connected later via hotplug
+
+        Ok(easydrm)
+    }
+
+    /// Discover all connected monitors and initialize them
+    fn discover_monitors(&mut self) -> Result<(), EasyDRMError> {
+        let res = self.card.resource_handles()?;
+
+        // Get all connector handles
+        let connector_handles: Vec<connector::Handle> = res.connectors().to_vec();
+
+        // Setup monitors
+        for connector_id in connector_handles {
+            match Monitor::setup(&self.card, &self.gbm_device, connector_id, |gl| {
+                (self.context_constructor)(gl)
+            }) {
+                Ok(monitor) => {
+                    self.monitors.insert(connector_id, monitor);
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to setup monitor {:?}: {}", connector_id, e);
+                }
+            }
+        }
+
+        // Group monitors by refresh rate
+        self.update_refresh_rate_groups();
+
+        Ok(())
+    }
+
+    /// Update refresh rate groups based on current monitors
+    fn update_refresh_rate_groups(&mut self) {
+        self.refresh_rate_groups.clear();
+
+        for (&connector_id, monitor) in self.monitors.iter() {
+            let refresh_rate = monitor.active_mode().vrefresh();
+            self.refresh_rate_groups
+                .entry(refresh_rate)
+                .or_default()
+                .push(connector_id);
+        }
+    }
+
+    /// Handle hotplug events - add/remove monitors as needed
+    fn handle_hotplug(&mut self) -> Result<(), EasyDRMError> {
+        let res = self.card.resource_handles()?;
+
+        // Get current connected monitors from DRM
+        let drm_connected = res
+            .connectors()
+            .into_iter()
+            .copied()
+            .collect::<HashSet<_>>();
+
+        // Get current monitor connector IDs
+        let current_monitors: HashSet<connector::Handle> =
+            self.monitors.keys().copied().collect();
+
+        // Find monitors that were disconnected
+        let disconnected: Vec<connector::Handle> = current_monitors
+            .difference(&drm_connected)
+            .copied()
+            .collect();
+
+        // Find monitors that were newly connected
+        let newly_connected: Vec<connector::Handle> = drm_connected
+            .difference(&current_monitors)
+            .copied()
+            .collect();
+
+        // Check if we need to update groups before consuming the vectors
+        let needs_update = !disconnected.is_empty() || !newly_connected.is_empty();
+
+        // Remove disconnected monitors
+        for connector_id in disconnected {
+            self.monitors.retain(|&c, _| c != connector_id);
+        }
+
+        // Add newly connected monitors
+        for connector_id in newly_connected {
+            match Monitor::setup(&self.card, &self.gbm_device, connector_id, |gl| {
+                (self.context_constructor)(gl)
+            }) {
+                Ok(monitor) => {
+                    self.monitors.insert(connector_id, monitor);
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to setup monitor {:?}: {}", connector_id, e);
+                }
+            }
+        }
+
+        // Update refresh rate groups if monitors changed
+        if needs_update {
+            self.update_refresh_rate_groups();
+        }
+
+        Ok(())
+    }
+
+    /// Poll for events (page flip, hotplug, etc.)
+    /// This blocks until an event is received
+    pub fn poll_events(&mut self) -> Result<(), EasyDRMError> {
+        let drm_fd = self.card.as_fd();
+        let uevents_socket = self.uevent_socket.as_ref();
+
+        // preparar descritores para poll
+        let mut fds = vec![PollFd::new(drm_fd, PollFlags::POLLIN)];
+        if let Some(uevents_socket) = uevents_socket {
+            fds.push(PollFd::new(uevents_socket.fd.as_fd(), PollFlags::POLLIN));
+        }
+
+        // bloquear até haver evento
+        poll(&mut fds, PollTimeout::NONE).ok();
+
+        let drm_ready = fds[0]
+            .revents()
+            .unwrap_or(PollFlags::empty())
+            .contains(PollFlags::POLLIN);
+
+
+        if let Some(uevents_socket) = uevents_socket {
+            let hotplug_ready = fds
+                .iter()
+                .find(|p| p.as_fd().as_raw_fd() == uevents_socket.fd.as_raw_fd())
+                .and_then(|p| p.revents())
+                .unwrap_or(PollFlags::empty())
+                .contains(PollFlags::POLLIN);
+
+            if hotplug_ready && uevents_socket.has_hotplug_event().unwrap_or(false) {
+	            println!("[INFO] Hotplug detected, refreshing monitors.");
+	            self.handle_hotplug()?;
+            }
+        }
+
+        if drm_ready {
+        	self.handle_drm_events()?;
+        }
+        Ok(())
+    }
+
+    /// Get an iterator over all monitors
+    pub fn monitors(&self) -> impl Iterator<Item = &Monitor<T>> {
+        self.monitors.values()
+    }
+
+    /// Get an iterator over all monitors
+    pub fn monitors_mut(&mut self) -> impl Iterator<Item = &mut Monitor<T>> {
+        self.monitors.values_mut()
+    }
+
+
+    /// Get a specific monitor by connector handle
+    pub fn get_monitor_mut(&mut self, connector_id: connector::Handle) -> Option<&mut Monitor<T>> {
+        self.monitors.get_mut(&connector_id)
+    }
+
+    /// Get a specific monitor by connector handle
+    pub fn get_monitor(&self, connector_id: connector::Handle) -> Option<&Monitor<T>> {
+    	self.monitors.get(&connector_id)
+    }
+
+
+    /// Swap buffers for all monitors that were drawn to
+    /// This is the global swap_buffers that coordinates all monitors
+    pub fn swap_buffers(&mut self) -> Result<(), EasyDRMError> {
+        // Rebuild the set with swapped monitors
+        for monitor in self.monitors.values_mut() {
+            if monitor.was_drawn() {
+                monitor.swap_buffers(&self.card)?;
+                monitor.reset_drawn_flag();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the number of connected monitors
+    pub fn monitor_count(&self) -> usize {
+        self.monitors.len()
+    }
+
+    /// Check if there are any monitors connected
+    pub fn has_monitors(&self) -> bool {
+        !self.monitors.is_empty()
+    }
+
+    /// Check if any monitor can render
+    pub fn any_can_render(&self) -> bool {
+        self.monitors.values().any(|m| m.can_render())
+    }
+
+    /// Get monitors grouped by refresh rate
+    /// Returns a map of refresh_rate -> list of connector handles
+    pub fn refresh_rate_groups(&self) -> &HashMap<u32, Vec<connector::Handle>> {
+        &self.refresh_rate_groups
+    }
+
+    fn handle_drm_events(&mut self) -> std::io::Result<()> {
+	    // Wait for events from DRM
+			for event in self.card.receive_events()? {
+				match event {
+					Event::PageFlip(page_flip_event) => {
+						// Find the monitor that completed the page flip
+						// Set can_render = true for that monitor
+						let crtc_handle = page_flip_event.crtc;
+
+						for monitor in self.monitors.values_mut() {
+							if monitor.crtc().handle() == crtc_handle {
+								monitor.set_can_render(true);
+							}
+						}
+					}
+					_ => {}
+				}
+			}
+			Ok(())
+    }
+}
+
+// Special implementation for unit type - no user context
+impl EasyDRM<()> {
+    /// Initialize EasyDRM without any custom context
+    ///
+    /// This is a convenience method for when you don't need per-monitor data.
+    /// Equivalent to `EasyDRM::init(|_gl| ())`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let easydrm = EasyDRM::init_empty()?;
+    ///
+    /// for monitor in easydrm.monitors() {
+    ///     // No custom context, just use GL directly
+    ///     let gl = monitor.gl();
+    ///     // ...
+    /// }
+    /// ```
+    pub fn init_empty() -> Result<Self, EasyDRMError> {
+        Self::init(|_gl| ())
+    }
+}
