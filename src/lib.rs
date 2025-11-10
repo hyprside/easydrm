@@ -51,7 +51,7 @@
 //!     frame_count: u32,
 //! }
 //!
-//! let mut easydrm = EasyDRM::init(|_gl| MyContext { frame_count: 0 }).unwrap();
+//! let mut easydrm = EasyDRM::init(|gl, width, height| MyContext { frame_count: 0 }).unwrap();
 //!
 //! for monitor in easydrm.monitors() {
 //!     let ctx = monitor.context_mut();
@@ -66,7 +66,7 @@ use std::os::unix::io::AsRawFd;
 use drm::Device;
 use drm::control::{Device as ControlDevice, Event, connector};
 use gbm::Device as GbmDevice;
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use thiserror::Error;
 
 use crate::card::Card;
@@ -102,7 +102,7 @@ pub struct EasyDRM<T> {
     fastest_group_refresh: Option<u32>,
     fastest_group_pending: HashSet<connector::Handle>,
     should_update_flag: bool,
-    context_constructor: Box<dyn Fn(&crate::gl::Gles2) -> T>,
+    context_constructor: Box<dyn Fn(&crate::gl::Gles2, usize, usize) -> T + 'static>,
     uevent_socket: Option<hotplug::UEventSocket>,
 }
 
@@ -130,7 +130,7 @@ impl<T> EasyDRM<T> {
     /// Monitors can be hot-plugged later and will be automatically discovered via `poll_events()`.
     pub fn init<F>(context_constructor: F) -> Result<Self, EasyDRMError>
     where
-        F: Fn(&crate::gl::Gles2) -> T + 'static,
+        F: Fn(&crate::gl::Gles2, usize, usize) -> T + 'static,
     {
         // Open DRM card
         let card = Card::open_default_card();
@@ -182,9 +182,12 @@ impl<T> EasyDRM<T> {
 
         // Setup monitors
         for connector_id in connector_handles {
-            match Monitor::setup(&self.card, &self.gbm_device, connector_id, |gl| {
-                (self.context_constructor)(gl)
-            }) {
+            match Monitor::setup(
+                &self.card,
+                &self.gbm_device,
+                connector_id,
+                |gl, width, height| (self.context_constructor)(gl, width, height),
+            ) {
                 Ok(monitor) => {
                     self.monitors.insert(connector_id, monitor);
                 }
@@ -211,11 +214,7 @@ impl<T> EasyDRM<T> {
                 .push(connector_id);
         }
 
-        self.fastest_group_refresh = self
-            .refresh_rate_groups
-            .keys()
-            .max()
-            .copied();
+        self.fastest_group_refresh = self.refresh_rate_groups.keys().max().copied();
         self.reset_fastest_group_pending();
     }
 
@@ -228,13 +227,12 @@ impl<T> EasyDRM<T> {
             }
         }
         // If there is no fastest group (i.e., no monitors), keep the flag false.
-        self.should_update_flag = self.fastest_group_pending.is_empty()
-            && self.fastest_group_refresh.is_some();
+        self.should_update_flag =
+            self.fastest_group_pending.is_empty() && self.fastest_group_refresh.is_some();
     }
 
     fn mark_fast_group_commit(&mut self, connector_id: connector::Handle) {
-        if self.fastest_group_pending.remove(&connector_id)
-            && self.fastest_group_pending.is_empty()
+        if self.fastest_group_pending.remove(&connector_id) && self.fastest_group_pending.is_empty()
         {
             self.should_update_flag = true;
         }
@@ -252,8 +250,7 @@ impl<T> EasyDRM<T> {
             .collect::<HashSet<_>>();
 
         // Get current monitor connector IDs
-        let current_monitors: HashSet<connector::Handle> =
-            self.monitors.keys().copied().collect();
+        let current_monitors: HashSet<connector::Handle> = self.monitors.keys().copied().collect();
 
         // Find monitors that were disconnected
         let disconnected: Vec<connector::Handle> = current_monitors
@@ -277,9 +274,12 @@ impl<T> EasyDRM<T> {
 
         // Add newly connected monitors
         for connector_id in newly_connected {
-            match Monitor::setup(&self.card, &self.gbm_device, connector_id, |gl| {
-                (self.context_constructor)(gl)
-            }) {
+            match Monitor::setup(
+                &self.card,
+                &self.gbm_device,
+                connector_id,
+                |gl, width, height| (self.context_constructor)(gl, width, height),
+            ) {
                 Ok(monitor) => {
                     self.monitors.insert(connector_id, monitor);
                 }
@@ -299,16 +299,23 @@ impl<T> EasyDRM<T> {
     /// Poll for events (page flip, hotplug, etc.)
     /// This blocks until an event is received
     pub fn poll_events(&mut self) -> Result<(), EasyDRMError> {
-    	self.poll_events_ex([])
+        self.poll_events_ex([])
     }
     /// Extended version of [[poll_events]] that allows waiting for additional fds
-    pub fn poll_events_ex(&mut self, extra_fds: impl IntoIterator<Item = RawFd>) -> Result<(), EasyDRMError> {
+    pub fn poll_events_ex(
+        &mut self,
+        extra_fds: impl IntoIterator<Item = RawFd>,
+    ) -> Result<(), EasyDRMError> {
         let drm_fd = self.card.as_fd();
         let uevents_socket = self.uevent_socket.as_ref();
 
         // preparar descritores para poll
         let mut fds = vec![PollFd::new(drm_fd, PollFlags::POLLIN)];
-        fds.extend(extra_fds.into_iter().map(|f| PollFd::new(unsafe { BorrowedFd::borrow_raw(f) }, PollFlags::POLLIN)));
+        fds.extend(
+            extra_fds
+                .into_iter()
+                .map(|f| PollFd::new(unsafe { BorrowedFd::borrow_raw(f) }, PollFlags::POLLIN)),
+        );
         if let Some(uevents_socket) = uevents_socket {
             fds.push(PollFd::new(uevents_socket.fd.as_fd(), PollFlags::POLLIN));
         }
@@ -321,7 +328,6 @@ impl<T> EasyDRM<T> {
             .unwrap_or(PollFlags::empty())
             .contains(PollFlags::POLLIN);
 
-
         if let Some(uevents_socket) = uevents_socket {
             let hotplug_ready = fds
                 .iter()
@@ -331,13 +337,13 @@ impl<T> EasyDRM<T> {
                 .contains(PollFlags::POLLIN);
 
             if hotplug_ready && uevents_socket.has_hotplug_event().unwrap_or(false) {
-	            println!("[INFO] Hotplug detected, refreshing monitors.");
-	            self.handle_hotplug()?;
+                println!("[INFO] Hotplug detected, refreshing monitors.");
+                self.handle_hotplug()?;
             }
         }
 
         if drm_ready {
-        	self.handle_drm_events()?;
+            self.handle_drm_events()?;
         }
         Ok(())
     }
@@ -352,7 +358,6 @@ impl<T> EasyDRM<T> {
         self.monitors.values_mut()
     }
 
-
     /// Get a specific monitor by connector handle
     pub fn get_monitor_mut(&mut self, connector_id: connector::Handle) -> Option<&mut Monitor<T>> {
         self.monitors.get_mut(&connector_id)
@@ -360,9 +365,8 @@ impl<T> EasyDRM<T> {
 
     /// Get a specific monitor by connector handle
     pub fn get_monitor(&self, connector_id: connector::Handle) -> Option<&Monitor<T>> {
-    	self.monitors.get(&connector_id)
+        self.monitors.get(&connector_id)
     }
-
 
     /// Swap buffers for all monitors that were drawn to.
     ///
@@ -426,24 +430,24 @@ impl<T> EasyDRM<T> {
     }
 
     fn handle_drm_events(&mut self) -> std::io::Result<()> {
-	    // Wait for events from DRM
-			for event in self.card.receive_events()? {
-				match event {
-					Event::PageFlip(page_flip_event) => {
-						// Find the monitor that completed the page flip
-						// Set can_render = true for that monitor
-						let crtc_handle = page_flip_event.crtc;
+        // Wait for events from DRM
+        for event in self.card.receive_events()? {
+            match event {
+                Event::PageFlip(page_flip_event) => {
+                    // Find the monitor that completed the page flip
+                    // Set can_render = true for that monitor
+                    let crtc_handle = page_flip_event.crtc;
 
-						for monitor in self.monitors.values_mut() {
-							if monitor.crtc().handle() == crtc_handle {
-								monitor.set_can_render(true);
-							}
-						}
-					}
-					_ => {}
-				}
-			}
-			Ok(())
+                    for monitor in self.monitors.values_mut() {
+                        if monitor.crtc().handle() == crtc_handle {
+                            monitor.set_can_render(true);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -466,6 +470,6 @@ impl EasyDRM<()> {
     /// }
     /// ```
     pub fn init_empty() -> Result<Self, EasyDRMError> {
-        Self::init(|_gl| ())
+        Self::init(|_, _, _| ())
     }
 }

@@ -19,7 +19,7 @@ struct MonitorContext {
 
 impl MonitorContext {
     /// Initialize context with access to OpenGL bindings
-    fn new(gl: &gl::Gles2) -> Self {
+    fn new(gl: &gl::Gles2, _width: usize, _height: usize) -> Self {
         // You could initialize OpenGL resources here if needed
         // For example: VAOs, VBOs, shaders, textures, etc.
 
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize EasyDRM with custom context constructor
     // The constructor is called for each monitor with access to its GL bindings
-    let mut easydrm = EasyDRM::init(|gl| MonitorContext::new(gl))?;
+    let mut easydrm = EasyDRM::init(MonitorContext::new)?;
 
     println!("EasyDRM initialized successfully!");
     println!("Found {} monitor(s)", easydrm.monitor_count());
@@ -90,8 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         // Render to each monitor that's ready
         // Use for_each_monitor_mut to get mutable access to contexts
-        for monitor in easydrm.monitors_mut()
-        {
+        for monitor in easydrm.monitors_mut() {
             if monitor.can_render() {
                 // Make this monitor's OpenGL context current
                 if let Ok(_) = monitor.make_current() {

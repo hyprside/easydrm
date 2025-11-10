@@ -102,7 +102,7 @@ impl<T> Monitor<T> {
         context_constructor: F,
     ) -> Result<Self, MonitorSetupError>
     where
-        F: FnOnce(&crate::gl::Gles2) -> T,
+        F: FnOnce(&crate::gl::Gles2, usize, usize) -> T,
     {
         let connector = card.get_connector(connector_id, true)?;
         let res = card.resource_handles()?;
@@ -116,7 +116,11 @@ impl<T> Monitor<T> {
             .ok_or(MonitorSetupError::NoCRTCFound)?;
 
         // Get the optimal/preferred mode (highest resolution + refresh rate)
-        let default_mode = connector.modes().first().cloned().ok_or(MonitorSetupError::NoModesFound)?;
+        let default_mode = connector
+            .modes()
+            .first()
+            .cloned()
+            .ok_or(MonitorSetupError::NoModesFound)?;
 
         // Get plane handles
         let planes = card.plane_handles()?;
@@ -182,7 +186,11 @@ impl<T> Monitor<T> {
         let gles_context = GlesContext::new(gbm_device, &default_mode)?;
 
         // Initialize user context with access to GL bindings
-        let user_context = context_constructor(gles_context.gl());
+        let user_context = context_constructor(
+            gles_context.gl(),
+            default_mode.size().0 as _,
+            default_mode.size().1 as _,
+        );
 
         // Cache DRM properties for atomic commits
         let connector_properties = card
