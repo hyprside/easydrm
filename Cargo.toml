@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "GLFW-inspired abstraction over DRM/KMS, GBM, and EGL/OpenGL that lets you build fullscreen Linux applications without a compositor (no X11, no Wayland)."
 license = "MIT"
+repository = "https://github.com/hyprside/easydrm"
+
 [dependencies]
 drm = "0.14.1"
 drm-sys = "0.8.0"
