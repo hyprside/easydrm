@@ -10,7 +10,7 @@
 //! - **Hot-plug detection** - monitors can be added/removed at runtime
 //! - **Zero-monitor graceful handling** - doesn't crash without monitors
 //! - **Per-monitor user context** - attach custom data (Skia, Cairo, etc.)
-//! - **VSync coordination** across multiple monitors with different refresh rates
+//! - **Refresh-rate grouping metadata** for diagnostics or custom scheduling strategies
 //! - **Atomic commits** with proper fence synchronization
 //! - **3-state mode management** for efficient mode setting
 //!
@@ -99,6 +99,9 @@ pub struct EasyDRM<T> {
     gbm_device: GbmDevice<std::fs::File>,
     monitors: HashMap<connector::Handle, Monitor<T>>,
     refresh_rate_groups: HashMap<u32, Vec<connector::Handle>>, // refresh_rate -> connector handles
+    fastest_group_refresh: Option<u32>,
+    fastest_group_pending: HashSet<connector::Handle>,
+    should_update_flag: bool,
     context_constructor: Box<dyn Fn(&crate::gl::Gles2) -> T>,
     uevent_socket: Option<hotplug::UEventSocket>,
 }
@@ -151,6 +154,9 @@ impl<T> EasyDRM<T> {
             gbm_device,
             monitors: HashMap::new(),
             refresh_rate_groups: HashMap::new(),
+            fastest_group_refresh: None,
+            fastest_group_pending: HashSet::new(),
+            should_update_flag: false,
             context_constructor: Box::new(context_constructor),
             uevent_socket: hotplug::UEventSocket::open().ok(),
         };
@@ -188,7 +194,6 @@ impl<T> EasyDRM<T> {
             }
         }
 
-        // Group monitors by refresh rate
         self.update_refresh_rate_groups();
 
         Ok(())
@@ -204,6 +209,34 @@ impl<T> EasyDRM<T> {
                 .entry(refresh_rate)
                 .or_default()
                 .push(connector_id);
+        }
+
+        self.fastest_group_refresh = self
+            .refresh_rate_groups
+            .keys()
+            .max()
+            .copied();
+        self.reset_fastest_group_pending();
+    }
+
+    fn reset_fastest_group_pending(&mut self) {
+        self.fastest_group_pending.clear();
+        if let Some(refresh) = self.fastest_group_refresh {
+            if let Some(connectors) = self.refresh_rate_groups.get(&refresh) {
+                self.fastest_group_pending
+                    .extend(connectors.iter().copied());
+            }
+        }
+        // If there is no fastest group (i.e., no monitors), keep the flag false.
+        self.should_update_flag = self.fastest_group_pending.is_empty()
+            && self.fastest_group_refresh.is_some();
+    }
+
+    fn mark_fast_group_commit(&mut self, connector_id: connector::Handle) {
+        if self.fastest_group_pending.remove(&connector_id)
+            && self.fastest_group_pending.is_empty()
+        {
+            self.should_update_flag = true;
         }
     }
 
@@ -331,15 +364,23 @@ impl<T> EasyDRM<T> {
     }
 
 
-    /// Swap buffers for all monitors that were drawn to
-    /// This is the global swap_buffers that coordinates all monitors
+    /// Swap buffers for all monitors that were drawn to.
+    ///
+    /// Each monitor that set `was_drawn = true` during this frame gets its own
+    /// `Monitor::swap_buffers()` call, which issues the atomic commit and
+    /// fence hand-off for that monitor.
     pub fn swap_buffers(&mut self) -> Result<(), EasyDRMError> {
         // Rebuild the set with swapped monitors
-        for monitor in self.monitors.values_mut() {
+        let mut committed = Vec::new();
+        for (&connector_id, monitor) in self.monitors.iter_mut() {
             if monitor.was_drawn() {
                 monitor.swap_buffers(&self.card)?;
                 monitor.reset_drawn_flag();
+                committed.push(connector_id);
             }
+        }
+        for connector_id in committed {
+            self.mark_fast_group_commit(connector_id);
         }
 
         Ok(())
@@ -360,10 +401,28 @@ impl<T> EasyDRM<T> {
         self.monitors.values().any(|m| m.can_render())
     }
 
-    /// Get monitors grouped by refresh rate
-    /// Returns a map of refresh_rate -> list of connector handles
+    /// Get monitors grouped by refresh rate.
+    ///
+    /// This is currently informational for callers that want to drive custom
+    /// scheduling policies; EasyDRM itself does not yet alter timing based on
+    /// these groups.
     pub fn refresh_rate_groups(&self) -> &HashMap<u32, Vec<connector::Handle>> {
         &self.refresh_rate_groups
+    }
+
+    /// Returns true once after every cycle where all monitors in the fastest refresh
+    /// rate group have swapped their buffers.
+    ///
+    /// Call this from your main loop to synchronize global logic (simulation, input
+    /// processing, etc.) to the fastest monitor's cadence.
+    pub fn should_update(&mut self) -> bool {
+        if self.should_update_flag {
+            self.should_update_flag = false;
+            self.reset_fastest_group_pending();
+            true
+        } else {
+            false
+        }
     }
 
     fn handle_drm_events(&mut self) -> std::io::Result<()> {
