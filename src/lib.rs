@@ -60,7 +60,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd, RawFd};
 use std::os::unix::io::AsRawFd;
 
 use drm::Device;
@@ -263,15 +263,19 @@ impl<T> EasyDRM<T> {
 
         Ok(())
     }
-
     /// Poll for events (page flip, hotplug, etc.)
     /// This blocks until an event is received
     pub fn poll_events(&mut self) -> Result<(), EasyDRMError> {
+    	self.poll_events_ex([])
+    }
+    /// Extended version of [[poll_events]] that allows waiting for additional fds
+    pub fn poll_events_ex(&mut self, extra_fds: impl IntoIterator<Item = RawFd>) -> Result<(), EasyDRMError> {
         let drm_fd = self.card.as_fd();
         let uevents_socket = self.uevent_socket.as_ref();
 
         // preparar descritores para poll
         let mut fds = vec![PollFd::new(drm_fd, PollFlags::POLLIN)];
+        fds.extend(extra_fds.into_iter().map(|f| PollFd::new(unsafe { BorrowedFd::borrow_raw(f) }, PollFlags::POLLIN)));
         if let Some(uevents_socket) = uevents_socket {
             fds.push(PollFd::new(uevents_socket.fd.as_fd(), PollFlags::POLLIN));
         }
