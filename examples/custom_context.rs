@@ -7,7 +7,7 @@
 //! - Per-monitor frame counting
 //! - Different colors per monitor
 
-use easydrm::{EasyDRM, gl};
+use easydrm::{EasyDRM, MonitorContextCreationRequest, gl};
 use rand::Rng;
 
 /// Custom context that holds per-monitor state
@@ -19,10 +19,11 @@ struct MonitorContext {
 
 impl MonitorContext {
     /// Initialize context with access to OpenGL bindings
-    fn new(gl: &gl::Gles2, _width: usize, _height: usize) -> Self {
+    fn new(req: &MonitorContextCreationRequest<'_>) -> Self {
         // You could initialize OpenGL resources here if needed
         // For example: VAOs, VBOs, shaders, textures, etc.
 
+        let gl = req.gl;
         unsafe {
             // Example: query GL version
             let version = std::ffi::CStr::from_ptr(gl.GetString(gl::VERSION) as *const i8);

@@ -88,7 +88,7 @@ The example prints detected monitors, animates a color wipe, and keeps running u
 ## API Sketch
 
 - `EasyDRM::init_empty()` – initialize without a custom per-monitor context.
-- `EasyDRM::init(|gl, width, height| { /* create custom context */ })` – attach your own data per monitor.
+- `EasyDRM::init(|req| { /* create custom context using req.gl / req.get_proc_address */ })` – attach your own data per monitor.
 - `EasyDRM::monitors()` / `monitors_mut()` – iterate over monitor handles.
 - `Monitor::make_current()` – bind this monitor’s GL context and mark it as drawn.
 - `Monitor::gl()` – access generated GLES2 bindings.

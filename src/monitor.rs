@@ -3,6 +3,7 @@ use std::{collections::HashMap, hash::Hash};
 use drm::control::{self, atomic::AtomicModeReq, connector, crtc, plane, property};
 use thiserror::Error;
 
+use crate::MonitorContextCreationRequest;
 use crate::gles_context::{GlesContext, GlesContextError};
 
 /// DRM resources dedicated to a monitor instance.
@@ -108,7 +109,7 @@ impl<T> Monitor<T> {
         context_constructor: F,
     ) -> Result<Self, MonitorSetupError>
     where
-        F: FnOnce(&crate::gl::Gles2, usize, usize) -> T,
+        F: for<'a> FnOnce(&MonitorContextCreationRequest<'a>) -> T,
     {
         let connector = card.get_connector(connector_id, true)?;
         let MonitorResourceAllocation {
@@ -127,11 +128,14 @@ impl<T> Monitor<T> {
         let gles_context = GlesContext::new(gbm_device, &default_mode)?;
 
         // Initialize user context with access to GL bindings
-        let user_context = context_constructor(
-            gles_context.gl(),
-            default_mode.size().0 as _,
-            default_mode.size().1 as _,
-        );
+        let get_proc_address = |symbol: &str| gles_context.get_proc_address(symbol);
+        let request = MonitorContextCreationRequest {
+            gl: gles_context.gl(),
+            width: default_mode.size().0 as _,
+            height: default_mode.size().1 as _,
+            get_proc_address: &get_proc_address,
+        };
+        let user_context = context_constructor(&request);
 
         // Cache DRM properties for atomic commits
         let connector_properties = card

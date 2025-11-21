@@ -51,7 +51,16 @@
 //!     frame_count: u32,
 //! }
 //!
-//! let mut easydrm = EasyDRM::init(|gl, width, height| MyContext { frame_count: 0 }).unwrap();
+//! let mut easydrm = EasyDRM::init(|req| {
+//!     println!(
+//!         "Monitor init: {}x{}, get symbol ptr example: {:?}",
+//!         req.width,
+//!         req.height,
+//!         (req.get_proc_address)("glCreateShader")
+//!     );
+//!     MyContext { frame_count: 0 }
+//! })
+//! .unwrap();
 //!
 //! for monitor in easydrm.monitors() {
 //!     let ctx = monitor.context_mut();
@@ -89,6 +98,18 @@ pub mod gl {
     include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
 }
 
+/// Data provided to the user callback when creating a per-monitor context.
+pub struct MonitorContextCreationRequest<'a> {
+    /// OpenGL ES bindings for this monitor.
+    pub gl: &'a crate::gl::Gles2,
+    /// Width of the monitor surface in pixels.
+    pub width: usize,
+    /// Height of the monitor surface in pixels.
+    pub height: usize,
+    /// Helper to load extra GL symbols (useful for third-party loaders).
+    pub get_proc_address: &'a dyn Fn(&str) -> *const std::ffi::c_void,
+}
+
 #[derive(Debug, Error)]
 pub enum EasyDRMError {
     #[error("IO Error: {0}")]
@@ -105,15 +126,17 @@ pub struct EasyDRM<T> {
     fastest_group_refresh: Option<u32>,
     fastest_group_pending: HashSet<connector::Handle>,
     should_update_flag: bool,
-    context_constructor: Box<dyn Fn(&crate::gl::Gles2, usize, usize) -> T + 'static>,
+    context_constructor: Box<dyn for<'a> Fn(&MonitorContextCreationRequest<'a>) -> T + 'static>,
     uevent_socket: Option<hotplug::UEventSocket>,
 }
 
 impl<T> EasyDRM<T> {
     /// Initialize EasyDRM with a custom context constructor for each monitor
     ///
-    /// The context_constructor is called for each monitor with access to its GL bindings,
-    /// allowing you to initialize per-monitor resources (like Skia surfaces, Cairo contexts, etc.)
+    /// The context_constructor receives a [`MonitorContextCreationRequest`] with access to GL
+    /// bindings, framebuffer size, and a `get_proc_address` helper so you can load extra
+    /// OpenGL functions during initialization. Use this to set up per-monitor resources
+    /// (Skia surfaces, Cairo contexts, etc.)
     ///
     /// # Example
     ///
@@ -122,9 +145,9 @@ impl<T> EasyDRM<T> {
     ///     skia_surface: skia::Surface,
     /// }
     ///
-    /// let easydrm = EasyDRM::init(|gl| {
+    /// let easydrm = EasyDRM::init(|req| {
     ///     MyContext {
-    ///         skia_surface: create_skia_surface(gl),
+    ///         skia_surface: create_skia_surface(req.gl),
     ///     }
     /// })?;
     /// ```
@@ -133,7 +156,7 @@ impl<T> EasyDRM<T> {
     /// Monitors can be hot-plugged later and will be automatically discovered via `poll_events()`.
     pub fn init<F>(context_constructor: F) -> Result<Self, EasyDRMError>
     where
-        F: Fn(&crate::gl::Gles2, usize, usize) -> T + 'static,
+        F: for<'a> Fn(&MonitorContextCreationRequest<'a>) -> T + 'static,
     {
         // Open DRM card
         let card = Card::open_default_card();
@@ -212,7 +235,7 @@ impl<T> EasyDRM<T> {
                 &self.gbm_device,
                 connector_id,
                 allocation,
-                |gl, width, height| (self.context_constructor)(gl, width, height),
+                |request| (self.context_constructor)(request),
             ) {
                 Ok(monitor) => {
                     used_crtcs.insert(monitor.crtc().handle());
@@ -329,7 +352,7 @@ impl<T> EasyDRM<T> {
                 &self.gbm_device,
                 connector_id,
                 allocation,
-                |gl, width, height| (self.context_constructor)(gl, width, height),
+                |request| (self.context_constructor)(request),
             ) {
                 Ok(monitor) => {
                     used_crtcs.insert(monitor.crtc().handle());
@@ -673,7 +696,7 @@ impl EasyDRM<()> {
     /// Initialize EasyDRM without any custom context
     ///
     /// This is a convenience method for when you don't need per-monitor data.
-    /// Equivalent to `EasyDRM::init(|_gl| ())`.
+    /// Equivalent to `EasyDRM::init(|_| ())`.
     ///
     /// # Example
     ///
@@ -687,6 +710,6 @@ impl EasyDRM<()> {
     /// }
     /// ```
     pub fn init_empty() -> Result<Self, EasyDRMError> {
-        Self::init(|_, _, _| ())
+        Self::init(|_| ())
     }
 }
