@@ -1,6 +1,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use nix::{sys::socket::*};
+use nix::errno::Errno;
+use nix::sys::socket::*;
 
 pub(crate) struct UEventSocket {
     pub(crate) fd: OwnedFd,
@@ -21,20 +22,28 @@ impl UEventSocket {
         bind(fd.as_raw_fd(), &addr)?;
         Ok(Self { fd })
     }
-    pub(crate) fn has_hotplug_event(&self) -> nix::Result<bool> {
+    pub(crate) fn drain_hotplug_events(&self) -> nix::Result<bool> {
         let mut buf = [0u8; 4096];
-        let len = recv(
-            self.fd.as_raw_fd(),
-            &mut buf,
-            nix::sys::socket::MsgFlags::empty(),
-        )?;
-        let msg = std::str::from_utf8(&buf[..len]).unwrap_or("");
+        let mut found = false;
 
-        // procurar sinais de hotplug DRM
-        let is_drm_hotplug = msg.contains("SUBSYSTEM=drm")
-            && msg.contains("HOTPLUG=1")
-            && (msg.contains("DEVTYPE=connector") || msg.contains("DEVNAME=card"));
+        loop {
+            match recv(self.fd.as_raw_fd(), &mut buf, MsgFlags::MSG_DONTWAIT) {
+                Ok(len) if len > 0 => {
+                    let msg = std::str::from_utf8(&buf[..len]).unwrap_or("");
+                    let is_drm_hotplug = msg.contains("SUBSYSTEM=drm")
+                        && msg.contains("HOTPLUG=1")
+                        && (msg.contains("DEVTYPE=connector") || msg.contains("DEVNAME=card"));
 
-        Ok(is_drm_hotplug)
+                    if is_drm_hotplug {
+                        found = true;
+                    }
+                }
+                Ok(_) => continue,
+                Err(Errno::EAGAIN) => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(found)
     }
 }

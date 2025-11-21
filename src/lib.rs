@@ -64,13 +64,16 @@ use std::os::fd::{AsFd, BorrowedFd, RawFd};
 use std::os::unix::io::AsRawFd;
 
 use drm::Device;
-use drm::control::{Device as ControlDevice, Event, connector};
+use drm::control::atomic::AtomicModeReq;
+use drm::control::{
+    AtomicCommitFlags, Device as ControlDevice, Event, PlaneType, connector, crtc, plane,
+};
 use gbm::Device as GbmDevice;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use thiserror::Error;
 
 use crate::card::Card;
-use crate::monitor::MonitorSetupError;
+use crate::monitor::{MonitorResourceAllocation, MonitorSetupError};
 
 mod card;
 mod gles_context;
@@ -179,16 +182,44 @@ impl<T> EasyDRM<T> {
 
         // Get all connector handles
         let connector_handles: Vec<connector::Handle> = res.connectors().to_vec();
+        let (mut used_crtcs, mut used_primary_planes, mut used_cursor_planes) =
+            self.current_resource_usage();
 
         // Setup monitors
         for connector_id in connector_handles {
+            if self.monitors.contains_key(&connector_id) {
+                continue;
+            }
+
+            let allocation = match self.allocate_monitor_resources(
+                connector_id,
+                &used_crtcs,
+                &used_primary_planes,
+                &used_cursor_planes,
+            ) {
+                Ok(allocation) => allocation,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to allocate resources for monitor {:?}: {}",
+                        connector_id, e
+                    );
+                    continue;
+                }
+            };
+
             match Monitor::setup(
                 &self.card,
                 &self.gbm_device,
                 connector_id,
+                allocation,
                 |gl, width, height| (self.context_constructor)(gl, width, height),
             ) {
                 Ok(monitor) => {
+                    used_crtcs.insert(monitor.crtc().handle());
+                    used_primary_planes.insert(monitor.primary_plane());
+                    if let Some(cursor) = monitor.cursor_plane() {
+                        used_cursor_planes.insert(cursor);
+                    }
                     self.monitors.insert(connector_id, monitor);
                 }
                 Err(e) => {
@@ -272,15 +303,40 @@ impl<T> EasyDRM<T> {
             self.monitors.retain(|&c, _| c != connector_id);
         }
 
+        let (mut used_crtcs, mut used_primary_planes, mut used_cursor_planes) =
+            self.current_resource_usage();
+
         // Add newly connected monitors
         for connector_id in newly_connected {
+            let allocation = match self.allocate_monitor_resources(
+                connector_id,
+                &used_crtcs,
+                &used_primary_planes,
+                &used_cursor_planes,
+            ) {
+                Ok(allocation) => allocation,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to allocate resources for monitor {:?}: {}",
+                        connector_id, e
+                    );
+                    continue;
+                }
+            };
+
             match Monitor::setup(
                 &self.card,
                 &self.gbm_device,
                 connector_id,
+                allocation,
                 |gl, width, height| (self.context_constructor)(gl, width, height),
             ) {
                 Ok(monitor) => {
+                    used_crtcs.insert(monitor.crtc().handle());
+                    used_primary_planes.insert(monitor.primary_plane());
+                    if let Some(cursor) = monitor.cursor_plane() {
+                        used_cursor_planes.insert(cursor);
+                    }
                     self.monitors.insert(connector_id, monitor);
                 }
                 Err(e) => {
@@ -295,6 +351,159 @@ impl<T> EasyDRM<T> {
         }
 
         Ok(())
+    }
+
+    fn current_resource_usage(
+        &self,
+    ) -> (
+        HashSet<crtc::Handle>,
+        HashSet<plane::Handle>,
+        HashSet<plane::Handle>,
+    ) {
+        let mut used_crtcs = HashSet::new();
+        let mut used_primary_planes = HashSet::new();
+        let mut used_cursor_planes = HashSet::new();
+
+        for monitor in self.monitors.values() {
+            used_crtcs.insert(monitor.crtc().handle());
+            used_primary_planes.insert(monitor.primary_plane());
+            if let Some(cursor) = monitor.cursor_plane() {
+                used_cursor_planes.insert(cursor);
+            }
+        }
+
+        (used_crtcs, used_primary_planes, used_cursor_planes)
+    }
+
+    fn allocate_monitor_resources(
+        &self,
+        connector_id: connector::Handle,
+        used_crtcs: &HashSet<crtc::Handle>,
+        used_primary_planes: &HashSet<plane::Handle>,
+        used_cursor_planes: &HashSet<plane::Handle>,
+    ) -> Result<MonitorResourceAllocation, MonitorSetupError> {
+        let connector = self.card.get_connector(connector_id, true)?;
+        if connector.state() != connector::State::Connected {
+            return Err(MonitorSetupError::NotConnected);
+        }
+
+        let res = self.card.resource_handles()?;
+        let crtc_candidates = self.crtc_candidates_for_connector(&connector, &res, used_crtcs)?;
+        let planes = self.card.plane_handles()?;
+        let plane_handles: Vec<plane::Handle> = planes.iter().copied().collect();
+
+        let mut crtc_info = None;
+        for handle in crtc_candidates {
+            if let Ok(info) = self.card.get_crtc(handle) {
+                crtc_info = Some(info);
+                break;
+            }
+        }
+        let crtc_info = crtc_info.ok_or(MonitorSetupError::NoCRTCFound)?;
+
+        let primary_plane = self
+            .find_plane_for_crtc(
+                &plane_handles,
+                &res,
+                crtc_info.handle(),
+                PlaneType::Primary,
+                used_primary_planes,
+            )?
+            .ok_or(MonitorSetupError::NoPrimaryPlaneFound)?;
+
+        let cursor_plane = self.find_plane_for_crtc(
+            &plane_handles,
+            &res,
+            crtc_info.handle(),
+            PlaneType::Cursor,
+            used_cursor_planes,
+        )?;
+
+        Ok(MonitorResourceAllocation {
+            crtc_info,
+            primary_plane,
+            cursor_plane,
+        })
+    }
+
+    fn crtc_candidates_for_connector(
+        &self,
+        connector: &connector::Info,
+        res: &drm::control::ResourceHandles,
+        used_crtcs: &HashSet<crtc::Handle>,
+    ) -> Result<Vec<crtc::Handle>, MonitorSetupError> {
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+
+        for encoder_handle in connector.encoders() {
+            let Ok(encoder) = self.card.get_encoder(*encoder_handle) else {
+                continue;
+            };
+
+            for crtc_handle in res.filter_crtcs(encoder.possible_crtcs()) {
+                if used_crtcs.contains(&crtc_handle) {
+                    continue;
+                }
+                if seen.insert(crtc_handle) {
+                    candidates.push(crtc_handle);
+                }
+            }
+        }
+
+        Ok(candidates)
+    }
+
+    fn find_plane_for_crtc(
+        &self,
+        plane_handles: &[plane::Handle],
+        res: &drm::control::ResourceHandles,
+        crtc_handle: crtc::Handle,
+        plane_type: PlaneType,
+        used_planes: &HashSet<plane::Handle>,
+    ) -> Result<Option<plane::Handle>, MonitorSetupError> {
+        for plane_handle in plane_handles {
+            if used_planes.contains(plane_handle) {
+                continue;
+            }
+
+            let Ok(plane_info) = self.card.get_plane(*plane_handle) else {
+                continue;
+            };
+            let compatible_crtcs = res.filter_crtcs(plane_info.possible_crtcs());
+            if !compatible_crtcs.contains(&crtc_handle) {
+                continue;
+            }
+
+            if self.plane_is_type(*plane_handle, plane_type)? {
+                return Ok(Some(*plane_handle));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn plane_is_type(
+        &self,
+        plane_handle: plane::Handle,
+        plane_type: PlaneType,
+    ) -> Result<bool, MonitorSetupError> {
+        let properties = self.card.get_properties(plane_handle)?;
+        for (&id, &value) in properties.iter() {
+            let Ok(info) = self.card.get_property(id) else {
+                continue;
+            };
+
+            if info
+                .name()
+                .to_str()
+                .map(|name| name == "type")
+                .unwrap_or(false)
+            {
+                return Ok(value == (plane_type as u32).into());
+            }
+        }
+
+        Ok(false)
     }
     /// Poll for events (page flip, hotplug, etc.)
     /// This blocks until an event is received
@@ -336,7 +545,7 @@ impl<T> EasyDRM<T> {
                 .unwrap_or(PollFlags::empty())
                 .contains(PollFlags::POLLIN);
 
-            if hotplug_ready && uevents_socket.has_hotplug_event().unwrap_or(false) {
+            if hotplug_ready && uevents_socket.drain_hotplug_events().unwrap_or(false) {
                 println!("[INFO] Hotplug detected, refreshing monitors.");
                 self.handle_hotplug()?;
             }
@@ -374,11 +583,14 @@ impl<T> EasyDRM<T> {
     /// `Monitor::swap_buffers()` call, which issues the atomic commit and
     /// fence hand-off for that monitor.
     pub fn swap_buffers(&mut self) -> Result<(), EasyDRMError> {
+        let mut atomic_req = AtomicModeReq::new();
+        // Determine commit flags
+        let flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::ALLOW_MODESET;
         // Rebuild the set with swapped monitors
         let mut committed = Vec::new();
         for (&connector_id, monitor) in self.monitors.iter_mut() {
             if monitor.was_drawn() {
-                monitor.swap_buffers(&self.card)?;
+                monitor.swap_buffers(&self.card, &mut atomic_req)?;
                 monitor.reset_drawn_flag();
                 committed.push(connector_id);
             }
@@ -386,6 +598,11 @@ impl<T> EasyDRM<T> {
         for connector_id in committed {
             self.mark_fast_group_commit(connector_id);
         }
+
+        // Submit atomic commit (queues the page flip, doesn't wait)
+        self.card
+            .atomic_commit(flags, atomic_req)
+            .map_err(|e| MonitorSetupError::DrmError(format!("Failed to commit: {}", e)))?;
 
         Ok(())
     }

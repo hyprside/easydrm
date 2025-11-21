@@ -1,11 +1,16 @@
 use std::{collections::HashMap, hash::Hash};
 
-use drm::control::{
-    self, AtomicCommitFlags, atomic::AtomicModeReq, connector, crtc, plane, property,
-};
+use drm::control::{self, atomic::AtomicModeReq, connector, crtc, plane, property};
 use thiserror::Error;
 
 use crate::gles_context::{GlesContext, GlesContextError};
+
+/// DRM resources dedicated to a monitor instance.
+pub(crate) struct MonitorResourceAllocation {
+    pub crtc_info: crtc::Info,
+    pub primary_plane: plane::Handle,
+    pub cursor_plane: Option<plane::Handle>,
+}
 
 /// Represents a connected display monitor with its own OpenGL ES rendering context.
 ///
@@ -99,88 +104,24 @@ impl<T> Monitor<T> {
         card: &impl control::Device,
         gbm_device: &gbm::Device<std::fs::File>,
         connector_id: connector::Handle,
+        allocation: MonitorResourceAllocation,
         context_constructor: F,
     ) -> Result<Self, MonitorSetupError>
     where
         F: FnOnce(&crate::gl::Gles2, usize, usize) -> T,
     {
         let connector = card.get_connector(connector_id, true)?;
-        let res = card.resource_handles()?;
-
-        // Get the first available CRTC
-        let crtcinfo: crtc::Info = res
-            .crtcs()
-            .iter()
-            .flat_map(|crtc| card.get_crtc(*crtc))
-            .next()
-            .ok_or(MonitorSetupError::NoCRTCFound)?;
-
+        let MonitorResourceAllocation {
+            crtc_info,
+            primary_plane,
+            cursor_plane,
+        } = allocation;
         // Get the optimal/preferred mode (highest resolution + refresh rate)
         let default_mode = connector
             .modes()
             .first()
             .cloned()
             .ok_or(MonitorSetupError::NoModesFound)?;
-
-        // Get plane handles
-        let planes = card.plane_handles()?;
-
-        // Find the primary plane compatible with this CRTC
-        let primary_plane_id = planes
-            .iter()
-            .find(|&&plane| {
-                card.get_plane(plane)
-                    .map(|plane_info| {
-                        // Check if plane is compatible with this CRTC
-                        let compatible_crtcs = res.filter_crtcs(plane_info.possible_crtcs());
-                        if !compatible_crtcs.contains(&crtcinfo.handle()) {
-                            return false;
-                        }
-
-                        // Check if this is a primary plane
-                        if let Ok(props) = card.get_properties(plane) {
-                            for (&id, &val) in props.iter() {
-                                if let Ok(info) = card.get_property(id)
-                                    && info.name().to_str().map(|x| x == "type").unwrap_or(false)
-                                {
-                                    return val == (control::PlaneType::Primary as u32).into();
-                                }
-                            }
-                        }
-                        false
-                    })
-                    .unwrap_or(false)
-            })
-            .copied()
-            .ok_or(MonitorSetupError::NoPrimaryPlaneFound)?;
-
-        // Find the cursor plane compatible with this CRTC (optional - not all GPUs have one)
-        let cursor_plane_id = planes
-            .iter()
-            .find(|&&plane| {
-                card.get_plane(plane)
-                    .map(|plane_info| {
-                        // Check if plane is compatible with this CRTC
-                        let compatible_crtcs = res.filter_crtcs(plane_info.possible_crtcs());
-                        if !compatible_crtcs.contains(&crtcinfo.handle()) {
-                            return false;
-                        }
-
-                        // Check if this is a cursor plane
-                        if let Ok(props) = card.get_properties(plane) {
-                            for (&id, &val) in props.iter() {
-                                if let Ok(info) = card.get_property(id)
-                                    && info.name().to_str().map(|x| x == "type").unwrap_or(false)
-                                {
-                                    return val == (control::PlaneType::Cursor as u32).into();
-                                }
-                            }
-                        }
-                        false
-                    })
-                    .unwrap_or(false)
-            })
-            .copied();
 
         // Create the OpenGL ES context for this monitor
         let gles_context = GlesContext::new(gbm_device, &default_mode)?;
@@ -201,14 +142,14 @@ impl<T> Monitor<T> {
             })?;
 
         let crtc_properties = card
-            .get_properties(crtcinfo.handle())?
+            .get_properties(crtc_info.handle())?
             .as_hashmap(card)
             .map_err(|e| {
                 MonitorSetupError::DrmError(format!("Failed to get CRTC properties: {}", e))
             })?;
 
         let plane_properties = card
-            .get_properties(primary_plane_id)?
+            .get_properties(primary_plane)?
             .as_hashmap(card)
             .map_err(|e| {
                 MonitorSetupError::DrmError(format!("Failed to get plane properties: {}", e))
@@ -216,12 +157,12 @@ impl<T> Monitor<T> {
 
         Ok(Monitor {
             connector_id,
-            current_crtc: crtcinfo,
+            current_crtc: crtc_info,
             default_mode,
             requested_mode: None, // Use default mode initially
             current_mode: None,   // No mode set in hardware yet
-            primary_plane_id,
-            cursor_plane_id,
+            primary_plane_id: primary_plane,
+            cursor_plane_id: cursor_plane,
             gles_context,
             can_render: true, // Initially ready to render
             was_drawn: false,
@@ -308,7 +249,9 @@ impl<T> Monitor<T> {
     pub(crate) fn swap_buffers(
         &mut self,
         card: &impl control::Device,
+        atomic_req: &mut AtomicModeReq,
     ) -> Result<(), MonitorSetupError> {
+        dbg!(self.connector_id);
         self.gles_context.make_current()?;
         // Flush GL and swap EGL buffers
         // Note: GL functions need to be loaded first with gl::load_with()
@@ -343,21 +286,70 @@ impl<T> Monitor<T> {
         })?;
 
         // Build atomic commit request
-        let mut atomic_req = AtomicModeReq::new();
 
         // Determine which mode to use
         let target_mode = self.requested_mode.as_ref().unwrap_or(&self.default_mode);
         let needs_mode_set = self.needs_mode_set();
 
-        // If mode set is needed (first frame or mode change)
-        if needs_mode_set {
-            // Set connector CRTC_ID
-            atomic_req.add_property(
-                self.connector_id,
-                self.connector_properties["CRTC_ID"].handle(),
-                property::Value::CRTC(Some(self.current_crtc.handle())),
-            );
+        // Set connector CRTC_ID
+        atomic_req.add_property(
+            self.connector_id,
+            self.connector_properties["CRTC_ID"].handle(),
+            property::Value::CRTC(Some(self.current_crtc.handle())),
+        );
+        atomic_req.add_property(
+            self.primary_plane_id,
+            self.plane_properties["CRTC_ID"].handle(),
+            property::Value::CRTC(Some(self.current_crtc.handle())),
+        );
 
+        // Configure plane for full-screen scanout
+        let (width, height) = target_mode.size();
+
+        // Source rectangle (in 16.16 fixed point)
+        atomic_req.add_property(
+            self.primary_plane_id,
+            self.plane_properties["SRC_X"].handle(),
+            property::Value::UnsignedRange(0),
+        );
+        atomic_req.add_property(
+            self.primary_plane_id,
+            self.plane_properties["SRC_Y"].handle(),
+            property::Value::UnsignedRange(0),
+        );
+        atomic_req.add_property(
+            self.primary_plane_id,
+            self.plane_properties["SRC_W"].handle(),
+            property::Value::UnsignedRange((width as u64) << 16),
+        );
+        atomic_req.add_property(
+            self.primary_plane_id,
+            self.plane_properties["SRC_H"].handle(),
+            property::Value::UnsignedRange((height as u64) << 16),
+        );
+
+        // Destination rectangle
+        atomic_req.add_property(
+            self.primary_plane_id,
+            self.plane_properties["CRTC_X"].handle(),
+            property::Value::SignedRange(0),
+        );
+        atomic_req.add_property(
+            self.primary_plane_id,
+            self.plane_properties["CRTC_Y"].handle(),
+            property::Value::SignedRange(0),
+        );
+        atomic_req.add_property(
+            self.primary_plane_id,
+            self.plane_properties["CRTC_W"].handle(),
+            property::Value::UnsignedRange(width as u64),
+        );
+        atomic_req.add_property(
+            self.primary_plane_id,
+            self.plane_properties["CRTC_H"].handle(),
+            property::Value::UnsignedRange(height as u64),
+        ); // If mode set is needed (first frame or mode change)
+        if needs_mode_set {
             // Create mode blob and set MODE_ID
             let mode_blob = card.create_property_blob(target_mode).map_err(|e| {
                 MonitorSetupError::DrmError(format!("Failed to create mode blob: {}", e))
@@ -373,59 +365,6 @@ impl<T> Monitor<T> {
                 self.current_crtc.handle(),
                 self.crtc_properties["ACTIVE"].handle(),
                 property::Value::Boolean(true),
-            );
-
-            // Configure plane for full-screen scanout
-            let (width, height) = target_mode.size();
-
-            atomic_req.add_property(
-                self.primary_plane_id,
-                self.plane_properties["CRTC_ID"].handle(),
-                property::Value::CRTC(Some(self.current_crtc.handle())),
-            );
-
-            // Source rectangle (in 16.16 fixed point)
-            atomic_req.add_property(
-                self.primary_plane_id,
-                self.plane_properties["SRC_X"].handle(),
-                property::Value::UnsignedRange(0),
-            );
-            atomic_req.add_property(
-                self.primary_plane_id,
-                self.plane_properties["SRC_Y"].handle(),
-                property::Value::UnsignedRange(0),
-            );
-            atomic_req.add_property(
-                self.primary_plane_id,
-                self.plane_properties["SRC_W"].handle(),
-                property::Value::UnsignedRange((width as u64) << 16),
-            );
-            atomic_req.add_property(
-                self.primary_plane_id,
-                self.plane_properties["SRC_H"].handle(),
-                property::Value::UnsignedRange((height as u64) << 16),
-            );
-
-            // Destination rectangle
-            atomic_req.add_property(
-                self.primary_plane_id,
-                self.plane_properties["CRTC_X"].handle(),
-                property::Value::SignedRange(0),
-            );
-            atomic_req.add_property(
-                self.primary_plane_id,
-                self.plane_properties["CRTC_Y"].handle(),
-                property::Value::SignedRange(0),
-            );
-            atomic_req.add_property(
-                self.primary_plane_id,
-                self.plane_properties["CRTC_W"].handle(),
-                property::Value::UnsignedRange(width as u64),
-            );
-            atomic_req.add_property(
-                self.primary_plane_id,
-                self.plane_properties["CRTC_H"].handle(),
-                property::Value::UnsignedRange(height as u64),
             );
         }
 
@@ -450,16 +389,6 @@ impl<T> Monitor<T> {
                 property::Value::SignedRange(fence_fd as i64),
             );
         }
-
-        // Determine commit flags
-        let mut flags = AtomicCommitFlags::PAGE_FLIP_EVENT;
-        if needs_mode_set {
-            flags |= AtomicCommitFlags::ALLOW_MODESET;
-        }
-
-        // Submit atomic commit (queues the page flip, doesn't wait)
-        card.atomic_commit(flags, atomic_req)
-            .map_err(|e| MonitorSetupError::DrmError(format!("Failed to commit: {}", e)))?;
 
         // Store buffer object, fence, and sync for next frame
         // Buffer must stay alive until after next lock_front_buffer (double-buffering)
